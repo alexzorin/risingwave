@@ -47,7 +47,7 @@ use risingwave_pb::catalog::{
 use risingwave_pb::ddl_service::alter_owner_request::Object;
 use risingwave_pb::ddl_service::{
     alter_name_request, alter_set_schema_request, alter_swap_rename_request, DdlProgress,
-    TableJobType, WaitVersion,
+    PbReplaceStreamingJobPlan, TableJobType, WaitVersion,
 };
 use risingwave_pb::meta::table_fragments::fragment::FragmentDistributionType;
 use risingwave_pb::meta::table_fragments::PbFragment;
@@ -142,7 +142,7 @@ pub enum DdlCommand {
     AlterName(alter_name_request::Object, String),
     AlterSwapRename(alter_swap_rename_request::Object),
     ReplaceTable(ReplaceTableInfo),
-    AlterSourceColumn(Source),
+    AlterSource(Source, Option<PbReplaceStreamingJobPlan>),
     AlterObjectOwner(Object, UserId),
     AlterSetSchema(alter_set_schema_request::Object, SchemaId),
     CreateConnection(Connection),
@@ -180,7 +180,7 @@ impl DdlCommand {
             DdlCommand::CreateStreamingJob(_, _, _, _)
             | DdlCommand::CreateSourceWithoutStreamingJob(_)
             | DdlCommand::ReplaceTable(_)
-            | DdlCommand::AlterSourceColumn(_)
+            | DdlCommand::AlterSource(_, _)
             | DdlCommand::CreateSubscription(_) => false,
         }
     }
@@ -345,7 +345,7 @@ impl DdlController {
                 }
                 DdlCommand::CreateSecret(secret) => ctrl.create_secret(secret).await,
                 DdlCommand::DropSecret(secret_id) => ctrl.drop_secret(secret_id).await,
-                DdlCommand::AlterSourceColumn(source) => ctrl.alter_source(source).await,
+                DdlCommand::AlterSource(source, plan) => ctrl.alter_source(source, plan).await,
                 DdlCommand::CommentOn(comment) => ctrl.comment_on(comment).await,
                 DdlCommand::CreateSubscription(subscription) => {
                     ctrl.create_subscription(subscription).await
@@ -458,11 +458,43 @@ impl DdlController {
 
     /// This replaces the source in the catalog.
     /// Note: `StreamSourceInfo` in downstream MVs' `SourceExecutor`s are not updated.
-    async fn alter_source(&self, source: Source) -> MetaResult<NotificationVersion> {
-        self.metadata_manager
+    async fn alter_source(
+        &self,
+        source: Source,
+        plan: Option<PbReplaceStreamingJobPlan>,
+    ) -> MetaResult<NotificationVersion> {
+        let version = self
+            .metadata_manager
             .catalog_controller
             .alter_source(source)
-            .await
+            .await?;
+        if let Some(PbReplaceStreamingJobPlan {
+            fragment_graph,
+            table_col_index_mapping,
+            source,
+            job_type,
+        }) = plan
+        {
+            let job_id = streaming_job.id();
+
+            let _reschedule_job_lock = self.stream_manager.reschedule_lock_read_guard().await;
+            let ctx = StreamContext::from_protobuf(fragment_graph.unwrap().get_ctx().unwrap());
+
+            // Ensure the max parallelism unchanged before replacing table.
+            let original_max_parallelism = self
+                .metadata_manager
+                .get_job_max_parallelism(streaming_job.id().into())
+                .await?;
+            let fragment_graph = PbStreamFragmentGraph {
+                max_parallelism: original_max_parallelism as _,
+                ..fragment_graph
+            };
+            // TODO: be careful about split alignment
+            // finish_replace_streaming_job
+        } else {
+            // Note: `StreamSourceInfo` in downstream MVs' `SourceExecutor`s are not updated.
+        }
+        Ok(version)
     }
 
     async fn create_function(&self, function: Function) -> MetaResult<NotificationVersion> {
@@ -1107,6 +1139,7 @@ impl DdlController {
         }
     }
 
+    /// `target_replace_info`: when dropping a sink into table, we need to replace the table.
     pub async fn drop_object(
         &self,
         object_type: ObjectType,

@@ -587,7 +587,11 @@ impl CatalogWriter for MockCatalogWriter {
         }
     }
 
-    async fn alter_source(&self, source: PbSource) -> Result<()> {
+    async fn alter_source(
+        &self,
+        source: PbSource,
+        _replace_streaming_job_plan: Option<PbReplaceStreamingJobPlan>,
+    ) -> Result<()> {
         self.catalog.write().update_source(&source);
         Ok(())
     }

@@ -121,8 +121,9 @@ pub async fn handle_alter_source_column(
     catalog.version += 1;
 
     let catalog_writer = session.catalog_writer()?;
+    let replace_plan = todo!();
     catalog_writer
-        .alter_source(catalog.to_prost(schema_id, db_id))
+        .alter_source(catalog.to_prost(schema_id, db_id), replace_plan)
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::ALTER_SOURCE))

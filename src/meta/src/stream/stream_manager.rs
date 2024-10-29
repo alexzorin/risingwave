@@ -457,6 +457,7 @@ impl GlobalStreamManager {
         }
     }
 
+    /// Send replace table command to barrier scheduler.
     pub async fn replace_table(
         &self,
         table_fragments: TableFragments,

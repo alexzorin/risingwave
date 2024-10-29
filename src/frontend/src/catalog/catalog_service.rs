@@ -184,7 +184,11 @@ pub trait CatalogWriter: Send + Sync {
     async fn alter_owner(&self, object: alter_owner_request::Object, owner_id: u32) -> Result<()>;
 
     /// Replace the source in the catalog.
-    async fn alter_source(&self, source: PbSource) -> Result<()>;
+    async fn alter_source(
+        &self,
+        source: PbSource,
+        replace_streaming_job_plan: Option<PbReplaceStreamingJobPlan>,
+    ) -> Result<()>;
 
     async fn alter_parallelism(
         &self,
@@ -483,8 +487,15 @@ impl CatalogWriter for CatalogWriterImpl {
         self.wait_version(version).await
     }
 
-    async fn alter_source(&self, source: PbSource) -> Result<()> {
-        let version = self.meta_client.alter_source(source).await?;
+    async fn alter_source(
+        &self,
+        source: PbSource,
+        replace_streaming_job_plan: Option<PbReplaceStreamingJobPlan>,
+    ) -> Result<()> {
+        let version = self
+            .meta_client
+            .alter_source(source, replace_streaming_job_plan)
+            .await?;
         self.wait_version(version).await
     }
 
