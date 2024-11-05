@@ -14,7 +14,7 @@
 
 mod schema;
 
-use apache_avro::schema::{DecimalSchema, NamesRef, RecordSchema, UnionSchema};
+use apache_avro::schema::{DecimalSchema, NamesRef, RecordSchema, ResolvedSchema, UnionSchema};
 use apache_avro::types::{Value, ValueKind};
 use apache_avro::{Decimal as AvroDecimal, Schema};
 use itertools::Itertools;
@@ -31,23 +31,23 @@ use super::utils::extract_decimal;
 use super::{bail_uncategorized, uncategorized, Access, AccessError, AccessResult};
 use crate::decoder::avro::schema::avro_schema_to_struct_field_name;
 
-#[derive(Clone)]
+// #[derive(Clone)]
 /// Options for parsing an `AvroValue` into Datum, with an optional avro schema.
 pub struct AvroParseOptions<'a> {
     /// Currently, this schema is only used for decimal.
     ///
     /// FIXME: In theory we should use resolved schema.
     /// e.g., it's possible that a field is a reference to a decimal or a record containing a decimal field.
-    schema: &'a Schema,
+    names: ResolvedSchema<'a>,
     // Strict Mode
     // If strict mode is disabled, an int64 can be parsed from an `AvroInt` (int32) value.
     // relax_numeric: bool,
 }
 
 impl<'a> AvroParseOptions<'a> {
-    pub fn create(schema: &'a Schema) -> Self {
+    pub fn create(root_schema: &'a Schema) -> Self {
         Self {
-            schema,
+            names: root_schema.try_into().unwrap(),
             // relax_numeric: true,
         }
     }
@@ -401,20 +401,23 @@ impl<'a> AvroParseOptions<'a> {
 }
 
 pub struct AvroAccess<'a> {
-    value: &'a Value,
+    root_value: &'a Value,
     options: AvroParseOptions<'a>,
 }
 
 impl<'a> AvroAccess<'a> {
-    pub fn new(value: &'a Value, options: AvroParseOptions<'a>) -> Self {
-        Self { value, options }
+    pub fn new(root_value: &'a Value, options: AvroParseOptions<'a>) -> Self {
+        Self {
+            root_value,
+            options,
+        }
     }
 }
 
 impl Access for AvroAccess<'_> {
     fn access<'a>(&'a self, path: &[&str], type_expected: &DataType) -> AccessResult<DatumCow<'a>> {
-        let mut value = self.value;
-        let mut options: AvroParseOptions<'_> = self.options.clone();
+        let mut value = self.root_value;
+        let mut schema = self.options.names.get_schemata()[0];
 
         debug_assert!(
             path.len() == 1
@@ -455,17 +458,17 @@ impl Access for AvroAccess<'_> {
                     // },
                     // ...]
                     value = v;
-                    options.schema = avro_schema_skip_nullable_union(options.schema).unwrap();
+                    schema = avro_schema_skip_nullable_union(schema).unwrap();
                     continue;
                 }
                 Value::Record(fields) => {
                     if let Some((_, v)) = fields.iter().find(|(k, _)| k == key) {
                         value = v;
 
-                        let Schema::Record(record_schema) = options.schema else {
+                        let Schema::Record(record_schema) = schema else {
                             unreachable!()
                         };
-                        options.schema = avro_extract_field_schema(record_schema, key).unwrap();
+                        schema = avro_extract_field_schema(record_schema, key).unwrap();
                         i += 1;
                         continue;
                     }
@@ -475,9 +478,8 @@ impl Access for AvroAccess<'_> {
             Err(create_error())?;
         }
 
-        let resolved: apache_avro::schema::ResolvedSchema<'_> = options.schema.try_into().unwrap();
-        let names = resolved.get_names();
-        AvroParseOptions::convert_to_datum(names, options.schema, value, type_expected)
+        let names = self.options.names.get_names();
+        AvroParseOptions::convert_to_datum(names, schema, value, type_expected)
     }
 }
 
