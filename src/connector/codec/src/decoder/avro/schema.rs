@@ -15,7 +15,7 @@
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Context;
-use apache_avro::schema::{DecimalSchema, RecordSchema, ResolvedSchema, Schema};
+use apache_avro::schema::{DecimalSchema, NamesRef, RecordSchema, ResolvedSchema, Schema};
 use apache_avro::AvroResult;
 use itertools::Itertools;
 use risingwave_common::error::NotImplemented;
@@ -48,6 +48,15 @@ impl ResolvedAvroSchema {
             original_schema: schema,
             resolved_schema,
         })
+    }
+}
+
+/// This is a shallow lookup instead of recursive. It cannot mutate `Ref` in subtrees.
+pub fn lookup_ref<'s>(original: &'s Schema, refs: &NamesRef<'s>) -> &'s Schema {
+    match original {
+        // `unwrap` is safe because errors already handled when generating `refs`.
+        Schema::Ref { name } => refs.get(name).unwrap(),
+        _ => original,
     }
 }
 
@@ -84,12 +93,19 @@ pub fn avro_schema_to_column_descs(
     schema: &Schema,
     map_handling: Option<MapHandling>,
 ) -> anyhow::Result<Vec<ColumnDesc>> {
+    let resolved: ResolvedSchema<'_> = schema.try_into()?;
     if let Schema::Record(RecordSchema { fields, .. }) = schema {
         let mut index = 0;
         let fields = fields
             .iter()
             .map(|field| {
-                avro_field_to_column_desc(&field.name, &field.schema, &mut index, map_handling)
+                avro_field_to_column_desc(
+                    &field.name,
+                    &field.schema,
+                    resolved.get_names(),
+                    &mut index,
+                    map_handling,
+                )
             })
             .collect::<anyhow::Result<_>>()?;
         Ok(fields)
@@ -104,11 +120,15 @@ const DBZ_VARIABLE_SCALE_DECIMAL_NAMESPACE: &str = "io.debezium.data";
 fn avro_field_to_column_desc(
     name: &str,
     schema: &Schema,
+    refs: &NamesRef<'_>,
     index: &mut i32,
     map_handling: Option<MapHandling>,
 ) -> anyhow::Result<ColumnDesc> {
-    let data_type = avro_type_mapping(schema, map_handling)?;
+    let data_type = avro_type_mapping(schema, refs, map_handling)?;
     match schema {
+        Schema::Ref { .. } => {
+            avro_field_to_column_desc(name, lookup_ref(schema, refs), refs, index, map_handling)
+        }
         Schema::Record(RecordSchema {
             name: schema_name,
             fields,
@@ -116,7 +136,7 @@ fn avro_field_to_column_desc(
         }) => {
             let vec_column = fields
                 .iter()
-                .map(|f| avro_field_to_column_desc(&f.name, &f.schema, index, map_handling))
+                .map(|f| avro_field_to_column_desc(&f.name, &f.schema, refs, index, map_handling))
                 .collect::<anyhow::Result<_>>()?;
             *index += 1;
             Ok(ColumnDesc {
@@ -149,6 +169,7 @@ fn avro_field_to_column_desc(
 /// This function expects resolved schema (no `Ref`).
 fn avro_type_mapping(
     schema: &Schema,
+    refs: &NamesRef<'_>,
     map_handling: Option<MapHandling>,
 ) -> anyhow::Result<DataType> {
     let data_type = match schema {
@@ -192,13 +213,13 @@ fn avro_type_mapping(
 
             let struct_fields = fields
                 .iter()
-                .map(|f| avro_type_mapping(&f.schema, map_handling))
+                .map(|f| avro_type_mapping(&f.schema, refs, map_handling))
                 .collect::<anyhow::Result<_>>()?;
             let struct_names = fields.iter().map(|f| f.name.clone()).collect_vec();
             DataType::new_struct(struct_fields, struct_names)
         }
         Schema::Array(item_schema) => {
-            let item_type = avro_type_mapping(item_schema.as_ref(), map_handling)?;
+            let item_type = avro_type_mapping(item_schema.as_ref(), refs, map_handling)?;
             DataType::List(Box::new(item_type))
         }
         Schema::Union(union_schema) => {
@@ -218,7 +239,7 @@ fn avro_type_mapping(
                 "Union contains duplicate types: {union_schema:?}",
             );
             match get_nullable_union_inner(union_schema) {
-                Some(inner) => avro_type_mapping(inner, map_handling)?,
+                Some(inner) => avro_type_mapping(inner, refs, map_handling)?,
                 None => {
                     // Convert the union to a struct, each field of the struct represents a variant of the union.
                     // Refer to https://github.com/risingwavelabs/risingwave/issues/16273#issuecomment-2179761345 to see why it's not perfect.
@@ -231,7 +252,7 @@ fn avro_type_mapping(
                         // null will mean the whole struct is null
                         .filter(|variant| !matches!(variant, &&Schema::Null))
                         .map(|variant| {
-                            avro_type_mapping(variant, map_handling).and_then(|t| {
+                            avro_type_mapping(variant, refs, map_handling).and_then(|t| {
                                 let name = avro_schema_to_struct_field_name(variant)?;
                                 Ok((t, name))
                             })
@@ -249,7 +270,8 @@ fn avro_type_mapping(
             {
                 DataType::Decimal
             } else {
-                bail_not_implemented!("Avro type: {:?}", schema);
+                // bail_not_implemented!("Avro type: {:?}", schema);
+                return avro_type_mapping(lookup_ref(schema, refs), refs, map_handling);
             }
         }
         Schema::Map(value_schema) => {
@@ -267,7 +289,7 @@ fn avro_type_mapping(
                     }
                 }
                 Some(MapHandling::Map) | None => {
-                    let value = avro_type_mapping(value_schema.as_ref(), map_handling)
+                    let value = avro_type_mapping(value_schema.as_ref(), refs, map_handling)
                         .context("failed to convert Avro map type")?;
                     DataType::Map(MapType::from_kv(DataType::Varchar, value))
                 }
