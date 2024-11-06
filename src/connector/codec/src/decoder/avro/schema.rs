@@ -96,6 +96,7 @@ pub fn avro_schema_to_column_descs(
     let resolved: ResolvedSchema<'_> = schema.try_into()?;
     if let Schema::Record(RecordSchema { fields, .. }) = schema {
         let mut index = 0;
+        let mut parse_trace: Vec<String> = vec![];
         let fields = fields
             .iter()
             .map(|field| {
@@ -104,6 +105,7 @@ pub fn avro_schema_to_column_descs(
                     &field.schema,
                     resolved.get_names(),
                     &mut index,
+                    &mut parse_trace,
                     map_handling,
                 )
             })
@@ -122,13 +124,19 @@ fn avro_field_to_column_desc(
     schema: &Schema,
     refs: &NamesRef<'_>,
     index: &mut i32,
+    parse_trace: &mut Vec<String>,
     map_handling: Option<MapHandling>,
 ) -> anyhow::Result<ColumnDesc> {
-    let data_type = avro_type_mapping(schema, refs, map_handling)?;
+    let data_type = avro_type_mapping(schema, refs, parse_trace, map_handling)?;
     match schema {
-        Schema::Ref { .. } => {
-            avro_field_to_column_desc(name, lookup_ref(schema, refs), refs, index, map_handling)
-        }
+        Schema::Ref { .. } => avro_field_to_column_desc(
+            name,
+            lookup_ref(schema, refs),
+            refs,
+            index,
+            parse_trace,
+            map_handling,
+        ),
         Schema::Record(RecordSchema {
             name: schema_name,
             fields,
@@ -136,7 +144,16 @@ fn avro_field_to_column_desc(
         }) => {
             let vec_column = fields
                 .iter()
-                .map(|f| avro_field_to_column_desc(&f.name, &f.schema, refs, index, map_handling))
+                .map(|f| {
+                    avro_field_to_column_desc(
+                        &f.name,
+                        &f.schema,
+                        refs,
+                        index,
+                        parse_trace,
+                        map_handling,
+                    )
+                })
                 .collect::<anyhow::Result<_>>()?;
             *index += 1;
             Ok(ColumnDesc {
@@ -166,10 +183,27 @@ fn avro_field_to_column_desc(
     }
 }
 
+fn detect_loop_and_push(
+    trace: &mut Vec<String>,
+    name: &apache_avro::schema::Name,
+) -> anyhow::Result<()> {
+    let identifier = name.fullname(None);
+    if trace.iter().any(|s| s == identifier.as_str()) {
+        anyhow::bail!(
+            "circular reference detected: {}, conflict with {}",
+            trace.iter().join("->"),
+            identifier,
+        );
+    }
+    trace.push(identifier);
+    Ok(())
+}
+
 /// This function expects resolved schema (no `Ref`).
 fn avro_type_mapping(
     schema: &Schema,
     refs: &NamesRef<'_>,
+    parse_trace: &mut Vec<String>,
     map_handling: Option<MapHandling>,
 ) -> anyhow::Result<DataType> {
     let data_type = match schema {
@@ -211,15 +245,18 @@ fn avro_type_mapping(
                 return Ok(DataType::Decimal);
             }
 
+            detect_loop_and_push(parse_trace, name)?;
             let struct_fields = fields
                 .iter()
-                .map(|f| avro_type_mapping(&f.schema, refs, map_handling))
+                .map(|f| avro_type_mapping(&f.schema, refs, parse_trace, map_handling))
                 .collect::<anyhow::Result<_>>()?;
+            parse_trace.pop();
             let struct_names = fields.iter().map(|f| f.name.clone()).collect_vec();
             DataType::new_struct(struct_fields, struct_names)
         }
         Schema::Array(item_schema) => {
-            let item_type = avro_type_mapping(item_schema.as_ref(), refs, map_handling)?;
+            let item_type =
+                avro_type_mapping(item_schema.as_ref(), refs, parse_trace, map_handling)?;
             DataType::List(Box::new(item_type))
         }
         Schema::Union(union_schema) => {
@@ -239,7 +276,7 @@ fn avro_type_mapping(
                 "Union contains duplicate types: {union_schema:?}",
             );
             match get_nullable_union_inner(union_schema) {
-                Some(inner) => avro_type_mapping(inner, refs, map_handling)?,
+                Some(inner) => avro_type_mapping(inner, refs, parse_trace, map_handling)?,
                 None => {
                     // Convert the union to a struct, each field of the struct represents a variant of the union.
                     // Refer to https://github.com/risingwavelabs/risingwave/issues/16273#issuecomment-2179761345 to see why it's not perfect.
@@ -252,10 +289,12 @@ fn avro_type_mapping(
                         // null will mean the whole struct is null
                         .filter(|variant| !matches!(variant, &&Schema::Null))
                         .map(|variant| {
-                            avro_type_mapping(variant, refs, map_handling).and_then(|t| {
-                                let name = avro_schema_to_struct_field_name(variant)?;
-                                Ok((t, name))
-                            })
+                            avro_type_mapping(variant, refs, parse_trace, map_handling).and_then(
+                                |t| {
+                                    let name = avro_schema_to_struct_field_name(variant)?;
+                                    Ok((t, name))
+                                },
+                            )
                         })
                         .process_results(|it| it.unzip::<_, _, Vec<_>, Vec<_>>())
                         .context("failed to convert Avro union to struct")?;
@@ -271,7 +310,12 @@ fn avro_type_mapping(
                 DataType::Decimal
             } else {
                 // bail_not_implemented!("Avro type: {:?}", schema);
-                return avro_type_mapping(lookup_ref(schema, refs), refs, map_handling);
+                return avro_type_mapping(
+                    lookup_ref(schema, refs),
+                    refs,
+                    parse_trace,
+                    map_handling,
+                );
             }
         }
         Schema::Map(value_schema) => {
@@ -289,8 +333,9 @@ fn avro_type_mapping(
                     }
                 }
                 Some(MapHandling::Map) | None => {
-                    let value = avro_type_mapping(value_schema.as_ref(), refs, map_handling)
-                        .context("failed to convert Avro map type")?;
+                    let value =
+                        avro_type_mapping(value_schema.as_ref(), refs, parse_trace, map_handling)
+                            .context("failed to convert Avro map type")?;
                     DataType::Map(MapType::from_kv(DataType::Varchar, value))
                 }
             }
