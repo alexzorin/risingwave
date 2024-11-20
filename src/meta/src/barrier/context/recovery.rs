@@ -122,14 +122,6 @@ impl GlobalBarrierWorkerContextImpl {
                         .await
                         .context("clean dirty streaming jobs")?;
 
-                    // Mview progress needs to be recovered.
-                    tracing::info!("recovering mview progress");
-                    let background_jobs = self
-                        .recover_background_mv_progress()
-                        .await
-                        .context("recover mview progress should not fail")?;
-                    tracing::info!("recovered mview progress");
-
                     // This is a quick path to accelerate the process of dropping and canceling streaming jobs.
                     let _ = self.scheduled_barriers.pre_apply_drop_cancel();
 
@@ -137,18 +129,11 @@ impl GlobalBarrierWorkerContextImpl {
                         ActiveStreamingWorkerNodes::new_snapshot(self.metadata_manager.clone())
                             .await?;
 
-                    let background_streaming_jobs = self
-                        .metadata_manager
-                        .list_background_creating_jobs()
-                        .await?;
-
                     // Resolve actor info for recovery. If there's no actor to recover, most of the
                     // following steps will be no-op, while the compute nodes will still be reset.
                     // FIXME: Transactions should be used.
                     // TODO(error-handling): attach context to the errors and log them together, instead of inspecting everywhere.
-                    let mut info = if !self.env.opts.disable_automatic_parallelism_control
-                        && background_streaming_jobs.is_empty()
-                    {
+                    let mut info = if !self.env.opts.disable_automatic_parallelism_control {
                         self.scale_actors(&active_streaming_nodes)
                             .await
                             .inspect_err(|err| {
@@ -215,6 +200,14 @@ impl GlobalBarrierWorkerContextImpl {
                     let stream_actors = self.load_all_actors().await.inspect_err(|err| {
                         warn!(error = %err.as_report(), "update actors failed");
                     })?;
+
+                    // Mview progress needs to be recovered.
+                    tracing::info!("recovering mview progress");
+                    let background_jobs = self
+                        .recover_background_mv_progress()
+                        .await
+                        .context("recover mview progress should not fail")?;
+                    tracing::info!("recovered mview progress");
 
                     // get split assignments for all actors
                     let source_splits = self.source_manager.list_assignments().await;
