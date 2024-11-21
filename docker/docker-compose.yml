@@ -1,6 +1,6 @@
 ---
 x-image: &image
-  image: ${RW_IMAGE:-risingwavelabs/risingwave:v2.0.1}
+  image: ${RW_IMAGE:-103365315157.dkr.ecr.ap-southeast-2.amazonaws.com/cd/future-arch/risingwave:latest}
 services:
   risingwave-standalone:
     <<: *image
